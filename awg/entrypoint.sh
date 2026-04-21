@@ -1,78 +1,73 @@
 #!/bin/bash
 set -e
 
-GATEWAY_TUN="${GATEWAY_TUN:-}"
-CONFIG_FILE="${CONFIG_FILE:-/etc/sing-box/config.json}"
-
-down_script() {
-    echo "=== Получен сигнал завершения (SIGTERM/SIGINT). Останавливаем sing-box ==="
-
-    if [ -n "${SINGBOX_PID:-}" ] && kill -0 "$SINGBOX_PID" 2>/dev/null; then
-        echo "Отправляем SIGTERM sing-box (PID $SINGBOX_PID)..."
-        kill -TERM "$SINGBOX_PID" 2>/dev/null || true
-        wait "$SINGBOX_PID" 2>/dev/null || true
-    fi
-
-    if [ -n "$GATEWAY_TUN" ]; then
-        echo "=== Очистка маршрутов и правил ==="
-        ip route del default dev "$GATEWAY_TUN" table singbox 2>/dev/null || true
-        ip rule del fwmark 0x99 table singbox 2>/dev/null || true
-    fi
-
-    echo "=== sing-box остановлен, контейнер завершается ==="
-}
-
-trap 'down_script; exit 0' SIGTERM SIGINT
+# Переменные из компоуз файла (по-умолчанию клиент)
+MODE="${MODE:-client}"
+CONFIG_FILE="${CONFIG_FILE:-/etc/amnezia/awg0.conf}"
+FORWARD_BLOCK_LIST="${FORWARD_BLOCK_LIST}"
+OUTBOUND_IP="${OUTBOUND_IP:-}"
 
 if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
     echo "Ошибка: Переменная CONFIG_FILE не установлена или файл не найден!"
     exit 1
 fi
 
-echo "Запускаем sing-box..."
-sing-box run -c "$CONFIG_FILE" &
-SINGBOX_PID=$!
+CONF_FILENAME=$(basename "$CONFIG_FILE")
+OUTPUT_DIR="/etc/amnezia/run"
+OUTPUT_CONF="$OUTPUT_DIR/$CONF_FILENAME"
+IFACE="${CONF_FILENAME%.conf}"
 
-if [ -n "$GATEWAY_TUN" ]; then
-    echo "Ожидаем появления интерфейса $GATEWAY_TUN..."
+iptables -P FORWARD DROP
+ip6tables -P FORWARD DROP || true
 
-    timeout=30
-    while [ $timeout -gt 0 ]; do
-        if ip -o link show "$GATEWAY_TUN" >/dev/null 2>&1; then
-            echo "Интерфейс $GATEWAY_TUN появился!"
-            break
-        fi
-        sleep 0.5
-        timeout=$((timeout - 1))
-    done
+mkdir -p "$OUTPUT_DIR"
 
-    if ! ip -o link show "$GATEWAY_TUN" >/dev/null 2>&1; then
-        echo "Ошибка: интерфейс $GATEWAY_TUN так и не появился за 30 секунд!"
-        kill $SINGBOX_PID 2>/dev/null || true
-        exit 1
+if [ "$MODE" = "server" ]; then
+    # Инициализация скрипта блока, если передан список
+    if [ -n "$FORWARD_BLOCK_LIST" ] && [ -f "$FORWARD_BLOCK_LIST" ]; then
+        echo "Обнаружен список источников блокировок: $FORWARD_BLOCK_LIST. Запускаем обновление..."
+
+        # Выполняем первичное обновление списков до поднятия интерфейса
+        /usr/local/bin/update_blocklist.sh "$FORWARD_BLOCK_LIST"
+
+        # Настройка ежесуточного cron'a (в 00:00). Вывод логов направляем в stdout докера
+        echo "0 0 * * * root /usr/local/bin/update_blocklist.sh $FORWARD_BLOCK_LIST > /proc/1/fd/1 2>&1" > /etc/cron.d/update_blocklist
+        chmod 0644 /etc/cron.d/update_blocklist
+        cron
+    else
+        echo "Файл источников FORWARD_BLOCK_LIST не задан или отсутствует. Создаем пустые списки."
+        # Если списка нет, создаем пустые сеты, чтобы iptables в up.sh не упал с ошибкой при запуске
+        ipset create forward-block-v4 hash:net family inet maxelem 200000 2>/dev/null || true
+        ipset create forward-block-v6 hash:net family inet6 maxelem 200000 2>/dev/null || true
     fi
-
-    echo "Настраиваем маршрутизацию и NAT..."
-
-    grep -q "singbox" /etc/iproute2/rt_tables || echo "99 singbox" >> /etc/iproute2/rt_tables
-
-    ip route add default dev "$GATEWAY_TUN" table singbox 2>/dev/null || true
-    ip rule add fwmark 0x99 table singbox 2>/dev/null || true
-
-    ip -o -4 addr show | while read -r _ iface _ ip_cidr _; do
-        iface=${iface%%@*}
-
-        [ "$iface" = "lo" ] && continue
-
-        ip=${ip_cidr%/*}
-        prefix=${ip_cidr#*/}
-
-        iptables -t mangle -A PREROUTING -i "$iface" -m addrtype ! --dst-type LOCAL -j MARK --set-mark 0x99  2>/dev/null || true
-        iptables -A FORWARD -i "$iface" -o "$GATEWAY_TUN" -j ACCEPT 2>/dev/null || true
-        iptables -A FORWARD -i "$GATEWAY_TUN" -o "$iface" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-        iptables -t nat -A POSTROUTING -s "$ip_cidr" -o "$GATEWAY_TUN" -j MASQUERADE 2>/dev/null || true
-    done
 fi
 
-echo "sing-box запущен и маршруты настроены. Держим контейнер живым..."
-wait $SINGBOX_PID
+# 1. Запуск питон скрипта (парсинг и генерация up/down скриптов)
+if [ -n "$OUTBOUND_IP" ]; then
+    python3 /usr/local/bin/process_config.py --mode "$MODE" --input "$CONFIG_FILE" --output-dir "$OUTPUT_DIR" --outbound-ip "$OUTBOUND_IP"
+else
+    python3 /usr/local/bin/process_config.py --mode "$MODE" --input "$CONFIG_FILE" --output-dir "$OUTPUT_DIR"
+fi
+
+# 2. Функция безопасного завершения
+down_script() {
+    echo "Получен сигнал остановки, откатываем интерфейс $IFACE..."
+    # awg-quick down сам вызовет PostDown={output-dir}/down.sh, но оборачиваем в || true чтобы не прервалось
+    awg-quick down "$OUTPUT_CONF" || true
+
+    # Для гарантии (т.к. скрипт идемпотентный, не страшно вызвать его 2 раза)
+    if [ -x "$OUTPUT_DIR/down.sh" ]; then
+        "$OUTPUT_DIR/down.sh" "$IFACE" || true
+    fi
+}
+
+# 3. Поднимаем туннель
+awg-quick up "$OUTPUT_CONF"
+
+# Перехватываем сигналы остановки от Docker для gracefull shutdown
+trap 'down_script; exit 0' SIGTERM SIGINT
+
+echo "AmneziaWG контейнер успешно запущен в режиме: $MODE"
+
+# 4. Удержание контейнера запущенным
+tail -f /dev/null & wait $!

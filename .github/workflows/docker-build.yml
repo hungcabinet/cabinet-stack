@@ -15,6 +15,9 @@ jobs:
           - context: ./awg
             dockerfile: Dockerfile
             image: awg
+          - context: ./sing-box
+            dockerfile: Dockerfile
+            image: sing-box
 
     steps:
       - name: Checkout code

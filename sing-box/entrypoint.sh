@@ -62,7 +62,9 @@ if [ -n "$GATEWAY_TUN" ]; then
     ip -o -4 addr show | while read -r _ iface _ ip_cidr _; do
         iface=${iface%%@*}
 
-        [ "$iface" = "lo" || "$iface" = "$GATEWAY_TUN" ] && continue
+        if [ "$iface" = "lo" ] || [ "$iface" = "$GATEWAY_TUN" ]; then
+            continue
+        fi
 
         ip=${ip_cidr%/*}
         prefix=${ip_cidr#*/}

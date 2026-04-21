@@ -10,19 +10,6 @@ if [ -z "$CONFIG_FILE" ] || [ ! -f "$CONFIG_FILE" ]; then
 fi
 
 if [ -n "$GATEWAY_TUN" ]; then
-    TUN_ADDRESS=$(jq -r --arg tun "$GATEWAY_TUN" '
-    .inbounds[]
-    | select(.interface_name == $tun)
-    | .address
-    | map(select(test("^[0-9.]+/")))
-    | .[0]
-    | split("/")[0]
-    ' "$CONFIG_FILE")
-
-    if [ -z "$TUN_ADDRESS" ] || [ "$TUN_ADDRESS" = "null" ]; then
-        echo "Ошибка: интерфейс $GATEWAY_TUN не найден или не содержит IPv4 адреса"
-        exit 1
-    fi
 
     grep -q "singbox" /etc/iproute2/rt_tables || echo "99 singbox" >> /etc/iproute2/rt_tables
 
